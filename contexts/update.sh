@@ -23,5 +23,5 @@ exec curl \
 	https://identity.foundation/presentation-exchange/submission/v1 -o presentation-submission.jsonld \
 	https://w3id.org/vdl/v1 -o w3id-vdl-v1.jsonld \
 	https://w3id.org/wallet/v1 -o w3id-wallet-v1.jsonld \
-	https://w3id.org/vc-status-list-2021/v1 -o w3id-vc-status-list-2021-v1.jsonld \
+	https://w3id.org/vc/status-list/v1 -o w3id-vc-status-list-2021-v1.jsonld \
 	-L
