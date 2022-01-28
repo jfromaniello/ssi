@@ -90,9 +90,11 @@ pub enum RevocationList2021Subject {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusList2021Credential {
-    id: URI,
-    issuer: Issuer,
-    credential_subject: RevocationList2021Subject,
+    pub id: URI,
+    pub issuer: Issuer,
+    pub credential_subject: RevocationList2021Subject,
+    #[serde(flatten)]
+    pub more_properties: Value,
 }
 
 /// Credential subject of type RevocationList2020, expected to be used in a Verifiable Credential of type [RevocationList2020Credential]
