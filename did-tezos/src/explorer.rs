@@ -1,5 +1,4 @@
 use anyhow::Result;
-use reqwest;
 use serde::Deserialize;
 use ssi::did::{Service, ServiceEndpoint, VerificationMethod, DIDURL};
 use ssi::one_or_many::OneOrMany;
@@ -7,9 +6,9 @@ use ssi::USER_AGENT;
 use std::convert::TryFrom;
 use url::Url;
 
-pub async fn retrieve_did_manager(bcd_url: &str, address: &str) -> Result<Option<String>> {
+pub async fn retrieve_did_manager(tzkt_url: &str, address: &str) -> Result<Option<String>> {
     let client = reqwest::Client::builder().build()?;
-    let url = Url::parse(bcd_url)?;
+    let url = Url::parse(tzkt_url)?;
     let contracts: Vec<String> = client
         .get(url.join("/v1/contracts")?)
         .query(&[
@@ -24,7 +23,7 @@ pub async fn retrieve_did_manager(bcd_url: &str, address: &str) -> Result<Option
         .json()
         .await?;
 
-    if contracts.len() > 0 {
+    if !contracts.is_empty() {
         Ok(Some(contracts[0].clone()))
     } else {
         Ok(None)
@@ -63,7 +62,7 @@ pub async fn execute_service_view(tzkt_url: &str, did: &str, contract: &str) -> 
         id: format!("{}{}", did, "#discovery"),
         type_: OneOrMany::One(service_result.service.type_.clone()),
         service_endpoint: Some(OneOrMany::One(ServiceEndpoint::URI(
-            service_result.service.endpoint.clone(),
+            service_result.service.endpoint,
         ))),
         property_set: None,
     })

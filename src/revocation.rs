@@ -11,11 +11,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+#[allow(clippy::upper_case_acronyms)]
 type URL = String;
 
 /// Minimum length of a revocation list bitstring
 /// <https://w3c-ccg.github.io/vc-status-rl-2020/#revocation-bitstring-length>
 pub const MIN_BITSTRING_LENGTH: usize = 131072;
+
+/// Maximum size of a revocation list credential loaded using [`load_credential`].
+pub const MAX_RESPONSE_LENGTH: usize = 2097152; // 2MB
 
 const EMPTY_RLIST: &str = "H4sIAAAAAAAA_-3AMQEAAADCoPVPbQwfKAAAAAAAAAAAAAAAAAAAAOBthtJUqwBAAAA";
 
@@ -279,6 +283,16 @@ impl CredentialStatus for RevocationList2020Status {
                 self.id
             ));
         }
+        // Check the revocation list URL before attempting to load it.
+        // Revocation List 2020 does not specify an expected URL scheme (URI scheme), but
+        // examples and test vectors use https.
+        match self.revocation_list_credential.split_once(':') {
+            Some(("https", _)) => (),
+            // TODO: an option to allow HTTP?
+            // TODO: load from DID URLs?
+            Some((_scheme, _)) => return result.with_error(format!("Invalid schema: {}", self.id)),
+            _ => return result.with_error(format!("Invalid rsrc: {}", self.id)),
+        }
         let revocation_list_credential =
             match load_credential(&self.revocation_list_credential).await {
                 Ok(credential) => credential,
@@ -292,7 +306,8 @@ impl CredentialStatus for RevocationList2020Status {
         let list_issuer_id = match &revocation_list_credential.issuer {
             Some(issuer) => issuer.get_id().clone(),
             None => {
-                return result.with_error(format!("Revocation list credential is missing issuer"));
+                return result
+                    .with_error("Revocation list credential is missing issuer".to_string());
             }
         };
         if issuer_id != list_issuer_id {
@@ -316,6 +331,8 @@ impl CredentialStatus for RevocationList2020Status {
         }
         for error in vc_result.errors {
             result.errors.push(format!("Revocation list: {}", error));
+        }
+        if !result.errors.is_empty() {
             return result;
         }
         // Note: vc_result.checks is not checked here. It is assumed that default checks passed.
@@ -403,6 +420,16 @@ impl CredentialStatus for RevocationList2021Status {
                 "Expected statusListCredential to be different from status id: {}",
                 self.id
             ));
+        }
+        // Check the status list URL before attempting to load it.
+        // Status List 2021 does not specify an expected URL scheme (URI scheme), but
+        // examples and test vectors use https.
+        match self.status_list_credential.split_once(':') {
+            Some(("https", _)) => (),
+            // TODO: an option to allow HTTP?
+            // TODO: load from DID URLs?
+            Some((_scheme, _)) => return result.with_error(format!("Invalid schema: {}", self.id)),
+            _ => return result.with_error(format!("Invalid rsrc: {}", self.id)),
         }
         let status_list_credential = match load_credential(&self.status_list_credential).await {
             Ok(credential) => credential,
@@ -505,17 +532,22 @@ pub enum LoadResourceError {
     NotFound,
     #[error("HTTP error: {0}")]
     HTTP(String),
+    /// The resource is larger than an expected/allowed maximum size.
+    #[error("Resource is too large: {size}, expected maximum: {max}")]
+    TooLarge {
+        /// The size of the resource so far, in bytes.
+        size: usize,
+        /// Maximum expected size of the resource, in bytes.
+        ///
+        /// e.g. [`MAX_RESPONSE_LENGTH`]
+        max: usize,
+    },
+    /// Unable to convert content-length header value.
+    #[error("Unable to convert content-length header value")]
+    ContentLengthConversion(#[source] std::num::TryFromIntError),
 }
 
-#[derive(Error, Debug)]
-pub enum LoadCredentialError {
-    #[error("Unable to load resource: {0}")]
-    Load(#[from] LoadResourceError),
-    #[error("Error reading HTTP response: {0}")]
-    Parse(#[from] serde_json::Error),
-}
-
-async fn load_resource(url: &str) -> Result<Vec<u8>, LoadCredentialError> {
+async fn load_resource(url: &str) -> Result<Vec<u8>, LoadResourceError> {
     #[cfg(test)]
     match url {
         crate::vc::tests::EXAMPLE_REVOCATION_2020_LIST_URL => {
@@ -531,30 +563,94 @@ async fn load_resource(url: &str) -> Result<Vec<u8>, LoadCredentialError> {
     let client = reqwest::Client::builder()
         .default_headers(headers)
         .build()
-        .map_err(|e| LoadResourceError::Build(e))?;
+        .map_err(LoadResourceError::Build)?;
     let accept = "application/json".to_string();
     let resp = client
         .get(url)
         .header("Accept", accept)
         .send()
         .await
-        .map_err(|e| LoadResourceError::Request(e))?;
+        .map_err(LoadResourceError::Request)?;
     if let Err(err) = resp.error_for_status_ref() {
         if err.status() == Some(reqwest::StatusCode::NOT_FOUND) {
-            Err(LoadResourceError::NotFound)?;
+            return Err(LoadResourceError::NotFound);
         }
-        Err(LoadResourceError::HTTP(err.to_string()))?;
+        return Err(LoadResourceError::HTTP(err.to_string()));
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| LoadResourceError::Response(e.to_string()))?
-        .to_vec();
-    Ok(bytes)
+    #[allow(unused_variables)]
+    let content_length_opt = if let Some(content_length) = resp.content_length() {
+        let len =
+            usize::try_from(content_length).map_err(LoadResourceError::ContentLengthConversion)?;
+        if len > MAX_RESPONSE_LENGTH {
+            // Fail early if content-length header indicates body is too large.
+            return Err(LoadResourceError::TooLarge {
+                size: len,
+                max: MAX_RESPONSE_LENGTH,
+            });
+        }
+        Some(len)
+    } else {
+        None
+    };
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Reqwest's WASM backend doesn't offer streamed/chunked response reading.
+        // So we cannot check the response size while reading the response here.
+        // Relevant issue: https://github.com/seanmonstar/reqwest/issues/1234
+        // Instead, we hope that the content-length is correct, read the body all at once,
+        // and apply the length check afterwards, for consistency.
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| LoadResourceError::Response(e.to_string()))?
+            .to_vec();
+        if bytes.len() > MAX_RESPONSE_LENGTH {
+            return Err(LoadResourceError::TooLarge {
+                size: bytes.len(),
+                max: MAX_RESPONSE_LENGTH,
+            });
+        }
+        Ok(bytes)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // For non-WebAssembly, read the response up to the allowed maximimum size.
+        let mut bytes = if let Some(len) = content_length_opt {
+            Vec::with_capacity(len)
+        } else {
+            Vec::new()
+        };
+        let mut resp = resp;
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| LoadResourceError::Response(e.to_string()))?
+        {
+            let len = bytes.len() + chunk.len();
+            if len > MAX_RESPONSE_LENGTH {
+                return Err(LoadResourceError::TooLarge {
+                    size: len,
+                    max: MAX_RESPONSE_LENGTH,
+                });
+            }
+            bytes.append(&mut chunk.to_vec());
+        }
+        Ok(bytes)
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum LoadCredentialError {
+    #[error("Unable to load resource: {0}")]
+    Load(#[from] LoadResourceError),
+    #[error("Error reading HTTP response: {0}")]
+    Parse(#[from] serde_json::Error),
 }
 
 /// Fetch a credential from a HTTP(S) URL.
 /// The resulting verifiable credential is not yet validated or verified.
+///
+/// The size of the loaded credential must not be greater than [`MAX_RESPONSE_LENGTH`].
 pub async fn load_credential(url: &str) -> Result<Credential, LoadCredentialError> {
     let data = load_resource(url).await?;
     // TODO: support JWT-VC
@@ -599,9 +695,9 @@ impl TryFrom<Credential> for RevocationList2020Credential {
             ));
         }
         let credential =
-            serde_json::to_value(credential).map_err(|e| CredentialConversionError::ToValue(e))?;
-        let credential = serde_json::from_value(credential)
-            .map_err(|e| CredentialConversionError::FromValue(e))?;
+            serde_json::to_value(credential).map_err(CredentialConversionError::ToValue)?;
+        let credential =
+            serde_json::from_value(credential).map_err(CredentialConversionError::FromValue)?;
         Ok(credential)
     }
 }
@@ -610,13 +706,13 @@ impl TryFrom<RevocationList2020Credential> for Credential {
     type Error = CredentialConversionError;
     fn try_from(credential: RevocationList2020Credential) -> Result<Self, Self::Error> {
         let mut credential =
-            serde_json::to_value(credential).map_err(|e| CredentialConversionError::ToValue(e))?;
+            serde_json::to_value(credential).map_err(CredentialConversionError::ToValue)?;
         use crate::vc::DEFAULT_CONTEXT;
         use serde_json::json;
         credential["@context"] = json!([DEFAULT_CONTEXT, REVOCATION_LIST_2020_V1_CONTEXT]);
         credential["type"] = json!(["VerifiableCredential", "RevocationList2020Credential"]);
-        let credential = serde_json::from_value(credential)
-            .map_err(|e| CredentialConversionError::FromValue(e))?;
+        let credential =
+            serde_json::from_value(credential).map_err(CredentialConversionError::FromValue)?;
         Ok(credential)
     }
 }
@@ -641,9 +737,9 @@ impl TryFrom<Credential> for StatusList2021Credential {
             ));
         }
         let credential =
-            serde_json::to_value(credential).map_err(|e| CredentialConversionError::ToValue(e))?;
-        let credential = serde_json::from_value(credential)
-            .map_err(|e| CredentialConversionError::FromValue(e))?;
+            serde_json::to_value(credential).map_err(CredentialConversionError::ToValue)?;
+        let credential =
+            serde_json::from_value(credential).map_err(CredentialConversionError::FromValue)?;
         Ok(credential)
     }
 }

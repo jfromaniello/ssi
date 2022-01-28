@@ -7,6 +7,10 @@
 [Decentralized Identifiers]: https://www.w3.org/TR/did-core/
 [Linked Data Proofs]: https://w3c-ccg.github.io/ld-proofs/
 
+## Updating
+
+Sometimes context files change over time. This crate aims to keep up to date with upstream changes in the context files it contains. To manually re-fetch the context files, run the script [update.sh](./update.sh) in the source directory.
+
 ## Licenses
 
 The licenses of the context files are summarized in the following table. For more details, see the [LICENSES.md](./LICENSES.md) file.
@@ -15,4 +19,4 @@ Files|License
 -|-
 W3C context files|[W3C Software and Document Notice and License](https://www.w3.org/Consortium/Legal/2015/copyright-software-and-document).
 Schema.org context files|[Creative Commons Attribution-ShareAlike 3.0 Unported (CC BY-SA 3.0)](https://creativecommons.org/licenses/by-sa/3.0/)
-[EcdsaSecp256k1RecoverySignature2020](https://github.com/decentralized-identity/EcdsaSecp256k1RecoverySignature2020/) context file|[Apache License, Version 2.0](http://www.apache.org/licenses/)
+[DIF](https://identity.foundation/) context files|[Apache License, Version 2.0](http://www.apache.org/licenses/)

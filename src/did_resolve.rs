@@ -31,7 +31,7 @@ pub const ERROR_UNAUTHORIZED: &str = "unauthorized";
 pub const ERROR_NOT_FOUND: &str = "notFound";
 pub const ERROR_METHOD_NOT_SUPPORTED: &str = "methodNotSupported";
 pub const ERROR_REPRESENTATION_NOT_SUPPORTED: &str = "representationNotSupported";
-pub const TYPE_DID_RESOLUTION: &'static str =
+pub const TYPE_DID_RESOLUTION: &str =
     "application/ld+json;profile=\"https://w3id.org/did-resolution\";charset=utf-8";
 
 // Maximum number of DID controllers to resolve at once
@@ -125,6 +125,15 @@ pub enum Content {
     Null,
 }
 
+#[cfg(feature = "http")]
+fn get_first_context_uri(value: &Value) -> Option<&str> {
+    match value.get("@context")? {
+        Value::Array(ref vec) => vec.get(0)?.as_str(),
+        Value::String(ref string) => Some(string.as_str()),
+        _ => None,
+    }
+}
+
 impl Content {
     pub fn into_vec(self) -> Result<Vec<u8>, Error> {
         if let Content::Data(data) = self {
@@ -137,9 +146,10 @@ impl Content {
 
 impl From<Error> for DereferencingMetadata {
     fn from(err: Error) -> Self {
-        let mut metadata = DereferencingMetadata::default();
-        metadata.error = Some(err.to_string());
-        metadata
+        DereferencingMetadata {
+            error: Some(err.to_string()),
+            ..Default::default()
+        }
     }
 }
 
@@ -171,17 +181,19 @@ impl From<DereferencingMetadata> for ResolutionMetadata {
 
 impl DereferencingMetadata {
     pub fn from_error(err: &str) -> Self {
-        let mut metadata = DereferencingMetadata::default();
-        metadata.error = Some(err.to_owned());
-        metadata
+        DereferencingMetadata {
+            error: Some(err.to_owned()),
+            ..Default::default()
+        }
     }
 }
 
 impl ResolutionMetadata {
     pub fn from_error(err: &str) -> Self {
-        let mut metadata = Self::default();
-        metadata.error = Some(err.to_owned());
-        metadata
+        ResolutionMetadata {
+            error: Some(err.to_owned()),
+            ..Default::default()
+        }
     }
 }
 
@@ -322,7 +334,7 @@ pub async fn dereference(
         .await;
     if let Some(ref error) = did_doc_res_meta.error {
         return (
-            DereferencingMetadata::from_error(&error),
+            DereferencingMetadata::from_error(error),
             Content::Null,
             ContentMetadata::default(),
         );
@@ -342,7 +354,7 @@ pub async fn dereference(
     let (deref_meta, content, content_meta) = dereference_primary_resource(
         resolver,
         &primary_did_url,
-        &did_url_dereferencing_input_metadata,
+        did_url_dereferencing_input_metadata,
         &did_doc_res_meta,
         did_doc,
         &did_doc_meta,
@@ -357,7 +369,7 @@ pub async fn dereference(
             resolver,
             primary_did_url,
             fragment,
-            &did_url_dereferencing_input_metadata,
+            did_url_dereferencing_input_metadata,
             deref_meta,
             content,
             content_meta,
@@ -392,7 +404,7 @@ async fn dereference_primary_resource(
     // 1
     if let Some(ref service) = parameters.service {
         // 1.1
-        let service = match did_doc.select_service(&service) {
+        let service = match did_doc.select_service(service) {
             Some(service) => service,
             None => {
                 return (
@@ -434,7 +446,7 @@ async fn dereference_primary_resource(
         // 1.2.2, 1.2.3
         let did_url = DIDURL::from(primary_did_url.clone());
         let output_service_endpoint_url =
-            match construct_service_endpoint(&did_url, &parameters, &input_service_endpoint_url) {
+            match construct_service_endpoint(&did_url, &parameters, input_service_endpoint_url) {
                 Ok(url) => url,
                 Err(err) => {
                     return (
@@ -486,6 +498,7 @@ async fn dereference_primary_resource(
         // TODO: enable the client to dereference the DID URL
     }
     // 4
+    #[allow(clippy::let_and_return)]
     let null_result = (
         DereferencingMetadata::default(),
         Content::Null,
@@ -505,7 +518,7 @@ async fn dereference_secondary_resource(
     content: Content,
     content_meta: ContentMetadata,
 ) -> (DereferencingMetadata, Content, ContentMetadata) {
-    let content_type = deref_meta.content_type.as_ref().map(String::as_str);
+    let content_type = deref_meta.content_type.as_deref();
     // 1
     match content {
         // https://www.w3.org/TR/did-core/#application-did-json
@@ -554,7 +567,7 @@ async fn dereference_secondary_resource(
             if url.contains('#') {
                 // https://w3c-ccg.github.io/did-resolution/#input
                 return (
-                    DereferencingMetadata::from_error(&format!("DID URL and input service endpoint URL MUST NOT both have a fragment component")),
+                    DereferencingMetadata::from_error("DID URL and input service endpoint URL MUST NOT both have a fragment component"),
                     Content::Null,
                     ContentMetadata::default()
                 );
@@ -568,7 +581,7 @@ async fn dereference_secondary_resource(
     // 3
     match content_type {
         None => (
-            DereferencingMetadata::from_error(&format!("Resource missing content type")),
+            DereferencingMetadata::from_error("Resource missing content type"),
             Content::Null,
             ContentMetadata::default(),
         ),
@@ -596,9 +609,10 @@ fn construct_service_endpoint(
     let input_service_endpoint_fragment = parts.next();
     if did_url.fragment.is_some() && input_service_endpoint_fragment.is_some() {
         // https://w3c-ccg.github.io/did-resolution/#input
-        return Err(format!(
+        return Err(
             "DID URL and input service endpoint URL MUST NOT both have a fragment component"
-        ));
+                .to_string(),
+        );
     }
     parts = service_endpoint_url.splitn(2, '?');
     let service_endpoint_url = parts.next().unwrap();
@@ -611,9 +625,7 @@ fn construct_service_endpoint(
         parts = relative_ref.splitn(2, '?');
         did_url_path = parts.next().unwrap().to_owned();
         if !did_url.path_abempty.is_empty() {
-            return Err(format!(
-                "DID URL and relativeRef MUST NOT both have a path component"
-            ));
+            return Err("DID URL and relativeRef MUST NOT both have a path component".to_string());
         }
         did_url_query = parts.next().map(|q| q.to_owned());
     } else {
@@ -623,9 +635,10 @@ fn construct_service_endpoint(
         // relativeRef query
     }
     if did_url_query.is_some() && input_service_endpoint_query.is_some() {
-        return Err(format!(
+        return Err(
             "DID URL and input service endpoint URL MUST NOT both have a query component"
-        ));
+                .to_string(),
+        );
     }
 
     let mut output_url = service_endpoint_url.to_owned();
@@ -649,7 +662,7 @@ fn construct_service_endpoint(
     // 8
     if let Some(fragment) = &did_url.fragment {
         output_url.push('#');
-        output_url.push_str(&fragment);
+        output_url.push_str(fragment);
     }
     Ok(output_url)
 }
@@ -667,6 +680,37 @@ impl HTTPDIDResolver {
             endpoint: url.to_string(),
         }
     }
+}
+
+fn transform_resolution_result(
+    result: Result<ResolutionResult, serde_json::Error>,
+) -> (
+    ResolutionMetadata,
+    Option<Document>,
+    Option<DocumentMetadata>,
+) {
+    let result: ResolutionResult = match result {
+        Ok(result) => result,
+        Err(err) => {
+            return (
+                ResolutionMetadata::from_error(&format!(
+                    "Error parsing resolution result: {}",
+                    err
+                )),
+                None,
+                None,
+            )
+        }
+    };
+    let res_meta = if let Some(mut meta) = result.did_resolution_metadata {
+        // https://www.w3.org/TR/did-core/#did-resolution-metadata
+        // contentType - "MUST NOT be present if the resolve function was called"
+        meta.content_type = None;
+        meta
+    } else {
+        ResolutionMetadata::default()
+    };
+    return (res_meta, result.did_document, result.did_document_metadata);
 }
 
 #[cfg(feature = "http")]
@@ -786,59 +830,49 @@ impl DIDResolver for HTTPDIDResolver {
             })),
         }
         .unwrap_or_else(|| "".to_string());
-        let mut res_meta = ResolutionMetadata::default();
-        let doc_opt;
-        let doc_meta_opt;
-        match &content_type[..] {
-            TYPE_DID_RESOLUTION => {
-                let result: ResolutionResult =
-                    match serde_json::from_slice(&res_result_representation) {
-                        Ok(result) => result,
-                        Err(err) => {
-                            return (
-                                ResolutionMetadata::from_error(&format!(
-                                    "Error parsing resolution result: {}",
-                                    err
-                                )),
-                                None,
-                                None,
-                            )
-                        }
-                    };
-                if let Some(meta) = result.did_resolution_metadata {
-                    res_meta = meta;
-                    // https://www.w3.org/TR/did-core/#did-resolution-metadata
-                    // contentType - "MUST NOT be present if the resolve function was called"
-                    res_meta.content_type = None;
-                };
-                doc_opt = result.did_document;
-                doc_meta_opt = result.did_document_metadata;
-            }
-            _ => {
-                if resp.status() == StatusCode::NOT_FOUND {
-                    res_meta.error = Some(ERROR_NOT_FOUND.to_string());
-                    doc_opt = None;
-                } else {
-                    // Assume the response is a JSON-LD DID Document by default.
-                    let doc: Document = match serde_json::from_slice(&res_result_representation) {
-                        Ok(doc) => doc,
-                        Err(err) => {
-                            return (
-                                ResolutionMetadata::from_error(&format!(
-                                    "Error parsing DID document: {}",
-                                    err
-                                )),
-                                None,
-                                None,
-                            )
-                        }
-                    };
-                    doc_opt = Some(doc);
-                }
-                doc_meta_opt = None;
-            }
+
+        if content_type == TYPE_DID_RESOLUTION {
+            // Handle result using DID Resolution Result media type (JSON-LD)
+            return transform_resolution_result(serde_json::from_slice(&res_result_representation));
         }
-        (res_meta, doc_opt, doc_meta_opt)
+
+        if resp.status() == StatusCode::NOT_FOUND {
+            return (ResolutionMetadata::from_error(ERROR_NOT_FOUND), None, None);
+        }
+
+        // Assume the response is JSON(-LD) (DID Document or DID Resolution result)
+        let value: Value = match serde_json::from_slice(&res_result_representation) {
+            Ok(result) => result,
+            Err(err) => {
+                return (
+                    ResolutionMetadata::from_error(&format!(
+                        "Error parsing resolution response: {}",
+                        err
+                    )),
+                    None,
+                    None,
+                )
+            }
+        };
+
+        let first_context_uri = get_first_context_uri(&value);
+        if first_context_uri == Some(crate::jsonld::DID_RESOLUTION_V1_CONTEXT) {
+            // Detect DID Resolution Result that didn't have specific media type.
+            return transform_resolution_result(serde_json::from_value(value));
+        }
+
+        // Assume the response is a JSON(-LD) DID Document by default.
+        let doc: Document = match serde_json::from_value(value) {
+            Ok(doc) => doc,
+            Err(err) => {
+                return (
+                    ResolutionMetadata::from_error(&format!("Error parsing DID document: {}", err)),
+                    None,
+                    None,
+                )
+            }
+        };
+        return (ResolutionMetadata::default(), Some(doc), None);
     }
 
     // Use default resolveRepresentation implementation in terms of resolve,
@@ -1107,7 +1141,7 @@ pub(crate) async fn easy_resolve(did: &str, resolver: &dyn DIDResolver) -> Resul
         .resolve(did, &ResolutionInputMetadata::default())
         .await;
     if let Some(err) = res_meta.error {
-        return Err(Error::UnableToResolve(err.to_string()));
+        return Err(Error::UnableToResolve(err));
     }
     let doc = doc_opt
         .ok_or_else(|| Error::UnableToResolve(format!("Missing document for DID: {}", did)))?;

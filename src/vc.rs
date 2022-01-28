@@ -1,8 +1,8 @@
 use std::collections::HashMap as Map;
-use std::convert::TryFrom;
+use std::convert::{TryFrom, TryInto};
 use std::str::FromStr;
 
-use crate::did_resolve::{DIDResolver, ResolutionInputMetadata};
+use crate::did_resolve::DIDResolver;
 use crate::error::Error;
 use crate::jsonld::{json_to_dataset, StaticLoader};
 use crate::jwk::{JWTKeys, JWK};
@@ -14,7 +14,7 @@ use crate::one_or_many::OneOrMany;
 use crate::rdf::DataSet;
 
 use async_trait::async_trait;
-use chrono::prelude::*;
+use chrono::{prelude::*, Duration, LocalResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -308,18 +308,125 @@ pub enum StringOrURI {
     URI(URI),
 }
 
+/// Represents NumericDate (see https://datatracker.ietf.org/doc/html/rfc7519#section-2)
+/// where the range is restricted to those in which microseconds can be exactly represented,
+/// which is approximately between the years 1685 and 2255, which was considered to be sufficient
+/// for the purposes of this crate.  Note that leap seconds are ignored by this type, just as
+/// they're ignored by NumericDate in the JWT standard.
+///
+/// An f64 value has 52 explicit mantissa bits, meaning that the biggest contiguous range
+/// of integer values is from -2^53 to 2^53 (52 zeros after the mantissa's implicit 1).
+/// Using this value to represent exact microseconds gives a maximum range of
+///     +-2^53 / (1000000 * 60 * 60 * 24 * 365.25) ~= +-285,
+/// which is centered around the Unix epoch start date Jan 1, 1970, 00:00:00 UTC, giving
+/// the years 1685 to 2255.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, PartialOrd)]
+pub struct NumericDate(f64);
+
+impl NumericDate {
+    /// This is -2^53 / 1_000_000, which is the smallest NumericDate that faithfully
+    /// represents full microsecond precision.
+    pub const MIN: NumericDate = NumericDate(-9_007_199_254.740_992);
+    /// This is 2^53 / 1_000_000, which is the largest NumericDate that faithfully
+    /// represents full microsecond precision.
+    pub const MAX: NumericDate = NumericDate(9_007_199_254.740_992);
+
+    /// Return the f64-valued number of seconds represented by this NumericDate.
+    pub fn as_seconds(self) -> f64 {
+        self.0
+    }
+    /// Try to create NumericDate from a f64 value, returning error upon out-of-range.
+    pub fn try_from_seconds(seconds: f64) -> Result<Self, Error> {
+        if seconds.abs() > Self::MAX.0 {
+            Err(Error::NumericDateOutOfMicrosecondPrecisionRange)
+        } else {
+            Ok(NumericDate(seconds))
+        }
+    }
+    /// Decompose NumericDate for use in Utc.timestamp and Utc.timestamp_opt
+    fn into_whole_seconds_and_fractional_nanoseconds(self) -> (i64, u32) {
+        let whole_seconds = self.0.floor() as i64;
+        let fractional_nanoseconds = ((self.0 - self.0.floor()) * 1_000_000_000.0).floor() as u32;
+        assert!(fractional_nanoseconds < 1_000_000_000);
+        (whole_seconds, fractional_nanoseconds)
+    }
+}
+
+/// Note that this will panic if the addition goes out-of-range.
+impl std::ops::Add<Duration> for NumericDate {
+    type Output = NumericDate;
+    fn add(self, rhs: Duration) -> Self::Output {
+        let self_dtu: DateTime<Utc> = self.into();
+        Self::Output::try_from(self_dtu + rhs).unwrap()
+    }
+}
+
+/// Note that this will panic if the addition goes out-of-range.
+impl std::ops::Sub<NumericDate> for NumericDate {
+    type Output = Duration;
+    fn sub(self, rhs: NumericDate) -> Self::Output {
+        let self_dtu: DateTime<Utc> = self.into();
+        let rhs_dtu: DateTime<Utc> = rhs.into();
+        Self::Output::try_from(self_dtu - rhs_dtu).unwrap()
+    }
+}
+
+/// Note that this will panic if the addition goes out-of-range.
+impl std::ops::Sub<Duration> for NumericDate {
+    type Output = NumericDate;
+    fn sub(self, rhs: Duration) -> Self::Output {
+        let self_dtu: DateTime<Utc> = self.into();
+        Self::Output::try_from(self_dtu - rhs).unwrap()
+    }
+}
+
+impl std::convert::TryFrom<DateTime<Utc>> for NumericDate {
+    type Error = Error;
+    fn try_from(dtu: DateTime<Utc>) -> Result<Self, Self::Error> {
+        // Have to take seconds and nanoseconds separately in order to get the full allowable
+        // range of microsecond-precision values as described above.
+        let whole_seconds = dtu.timestamp() as f64;
+        let fractional_seconds = dtu.timestamp_nanos().rem_euclid(1_000_000_000) as f64 * 1.0e-9;
+        Ok(Self::try_from_seconds(whole_seconds + fractional_seconds)?)
+    }
+}
+
+impl std::convert::TryFrom<DateTime<FixedOffset>> for NumericDate {
+    type Error = Error;
+    fn try_from(dtfo: DateTime<FixedOffset>) -> Result<Self, Self::Error> {
+        let dtu = DateTime::<Utc>::from(dtfo);
+        Ok(NumericDate::try_from(dtu)?)
+    }
+}
+
+impl std::convert::Into<DateTime<Utc>> for NumericDate {
+    fn into(self) -> DateTime<Utc> {
+        let (whole_seconds, fractional_nanoseconds) =
+            self.into_whole_seconds_and_fractional_nanoseconds();
+        Utc.timestamp(whole_seconds, fractional_nanoseconds)
+    }
+}
+
+impl std::convert::Into<LocalResult<DateTime<Utc>>> for NumericDate {
+    fn into(self) -> LocalResult<DateTime<Utc>> {
+        let (whole_seconds, fractional_nanoseconds) =
+            self.into_whole_seconds_and_fractional_nanoseconds();
+        Utc.timestamp_opt(whole_seconds, fractional_nanoseconds)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[non_exhaustive]
 pub struct JWTClaims {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "exp")]
-    pub expiration_time: Option<i64>,
+    pub expiration_time: Option<NumericDate>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "iss")]
     pub issuer: Option<StringOrURI>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "nbf")]
-    pub not_before: Option<i64>,
+    pub not_before: Option<NumericDate>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "jti")]
     pub jwt_id: Option<String>,
@@ -392,7 +499,7 @@ pub enum Check {
 }
 
 // https://w3c-ccg.github.io/vc-http-api/#/Verifier/verifyCredential
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 /// Object summarizing a verification
 /// Reference: vc-http-api
@@ -428,11 +535,7 @@ impl Default for LinkedDataProofOptions {
 
 impl VerificationResult {
     pub fn new() -> Self {
-        Self {
-            checks: vec![],
-            warnings: vec![],
-            errors: vec![],
-        }
+        Self::default()
     }
 
     pub fn error(err: &str) -> Self {
@@ -536,7 +639,7 @@ impl TryFrom<String> for URI {
 }
 
 impl URI {
-    fn as_str(self: &Self) -> &str {
+    fn as_str(&self) -> &str {
         match self {
             URI::String(string) => string.as_str(),
         }
@@ -584,7 +687,7 @@ impl From<URI> for StringOrURI {
 }
 
 impl StringOrURI {
-    fn as_str(self: &Self) -> &str {
+    fn as_str(&self) -> &str {
         match self {
             StringOrURI::URI(URI::String(string)) => string.as_str(),
             StringOrURI::String(string) => string.as_str(),
@@ -595,8 +698,8 @@ impl StringOrURI {
 impl FromStr for VCDateTime {
     type Err = chrono::format::ParseError;
     fn from_str(date_time: &str) -> Result<Self, Self::Err> {
-        let use_z = date_time.ends_with("Z");
-        let date_time = DateTime::parse_from_rfc3339(&date_time)?.into();
+        let use_z = date_time.ends_with('Z');
+        let date_time = DateTime::parse_from_rfc3339(date_time)?;
         Ok(VCDateTime { date_time, use_z })
     }
 }
@@ -642,7 +745,7 @@ fn jwt_encode(claims: &JWTClaims, keys: &JWTKeys) -> Result<String, Error> {
         return Err(Error::MissingKey);
     };
     let algorithm = jwk.get_algorithm().ok_or(Error::MissingAlgorithm)?;
-    Ok(crate::jwt::encode_sign(algorithm, claims, &jwk)?)
+    crate::jwt::encode_sign(algorithm, claims, jwk)
 }
 
 // Ensure a verification relationship exists between a given issuer and verification method for a
@@ -660,7 +763,7 @@ pub(crate) async fn ensure_verification_relationship(
     let vmm = vmms.get(vm).ok_or_else(|| {
         Error::MissingVerificationRelationship(issuer.to_string(), proof_purpose, vm.to_string())
     })?;
-    vmm.match_jwk(&jwk)?;
+    vmm.match_jwk(jwk)?;
     Ok(())
 }
 
@@ -676,10 +779,10 @@ pub(crate) async fn pick_default_vm(
     let mut err = Error::MissingKey;
     for (vm_id, vmm) in vm_ids {
         // Try to find a VM that matches this JWK and controller.
-        match vmm.match_jwk(&jwk) {
+        match vmm.match_jwk(jwk) {
             Ok(()) => {
                 // Found appropriate VM.
-                return Ok(vm_id.to_string());
+                return Ok(vm_id);
             }
             Err(e) => err = e,
         }
@@ -710,11 +813,11 @@ impl Credential {
         } else {
             return Err(Error::MissingKey);
         };
-        Credential::from_jwt(jwt, &jwk)
+        Credential::from_jwt(jwt, jwk)
     }
 
     pub fn from_jwt(jwt: &str, key: &JWK) -> Result<Self, Error> {
-        let token_data: JWTClaims = crate::jwt::decode_verify(jwt, &key)?;
+        let token_data: JWTClaims = crate::jwt::decode_verify(jwt, key)?;
         Self::from_jwt_claims(token_data)
     }
 
@@ -738,20 +841,26 @@ impl Credential {
             None => return Err(Error::MissingCredential),
         };
         if let Some(exp) = claims.expiration_time {
-            vc.expiration_date = Utc.timestamp_opt(exp, 0).latest().map(|time| VCDateTime {
+            let exp_date_time: LocalResult<DateTime<Utc>> = exp.into();
+            vc.expiration_date = exp_date_time.latest().map(|time| VCDateTime {
                 date_time: time.into(),
                 use_z: true,
             });
         }
         if let Some(iss) = claims.issuer {
             if let StringOrURI::URI(issuer_uri) = iss {
-                vc.issuer = Some(Issuer::URI(issuer_uri));
+                if let Some(Issuer::Object(ref mut issuer)) = vc.issuer {
+                    issuer.id = issuer_uri;
+                } else {
+                    vc.issuer = Some(Issuer::URI(issuer_uri));
+                }
             } else {
                 return Err(Error::InvalidIssuer);
             }
         }
         if let Some(nbf) = claims.not_before {
-            if let Some(time) = Utc.timestamp_opt(nbf, 0).latest() {
+            let nbf_date_time: LocalResult<DateTime<Utc>> = nbf.into();
+            if let Some(time) = nbf_date_time.latest() {
                 vc.issuance_date = Some(VCDateTime {
                     date_time: time.into(),
                     use_z: true,
@@ -779,35 +888,39 @@ impl Credential {
     }
 
     pub fn to_jwt_claims(&self) -> Result<JWTClaims, Error> {
-        let subject = match self.credential_subject.to_single() {
-            Some(subject) => subject,
-            None => return Err(Error::InvalidSubject),
-        };
-        let subject_id: String = match subject.id.clone() {
-            Some(id) => id.into(),
-            // Credential subject must have id for JWT
-            None => return Err(Error::InvalidSubject),
-        };
-
-        let mut vc = self.clone();
-        // Remove fields from vc that are duplicated into the claims,
-        // except for timestamps (in case of conversion discrepencies).
-        Ok(JWTClaims {
-            expiration_time: vc
-                .expiration_date
-                .as_ref()
-                .map(|date| date.date_time.timestamp()),
-            issuer: match vc.issuer.take() {
-                Some(Issuer::URI(uri)) => Some(StringOrURI::URI(uri)),
-                Some(_) => return Err(Error::InvalidIssuer),
+        let subject_opt = self.credential_subject.to_single().clone();
+        let subject = match subject_opt {
+            Some(subject) => match subject.id.as_ref() {
+                Some(id) => Some(StringOrURI::String(id.to_string())),
                 None => None,
             },
-            not_before: vc
-                .issuance_date
-                .as_ref()
-                .map(|date| date.date_time.timestamp()),
-            jwt_id: vc.id.take().map(|id| id.into()),
-            subject: Some(StringOrURI::String(subject_id)),
+            None => None,
+        };
+
+        let vc = self.clone();
+
+        // Copy fields from vc that are duplicated into the claims.
+        let (id, issuer) = (vc.id.clone(), vc.issuer.clone());
+        // Note that try_into can fail if the date_time overflows the range for NumericDate
+        // for expiration_time and not_before.
+        let expiration_time: Option<NumericDate> = match vc.expiration_date.as_ref() {
+            Some(date) => Some(date.date_time.try_into()?),
+            None => None,
+        };
+        let not_before: Option<NumericDate> = match vc.issuance_date.as_ref() {
+            Some(date) => Some(date.date_time.try_into()?),
+            None => None,
+        };
+        Ok(JWTClaims {
+            expiration_time,
+            issuer: match issuer {
+                Some(Issuer::URI(uri)) => Some(StringOrURI::URI(uri)),
+                Some(Issuer::Object(object_with_id)) => Some(StringOrURI::URI(object_with_id.id)),
+                None => None,
+            },
+            not_before,
+            jwt_id: id.map(|id| id.into()),
+            subject,
             verifiable_credential: Some(vc),
             ..Default::default()
         })
@@ -819,7 +932,7 @@ impl Credential {
             audience: Some(OneOrMany::One(StringOrURI::try_from(aud.to_string())?)),
             ..self.to_jwt_claims()?
         };
-        Ok(crate::jwt::encode_unsigned(&claims)?)
+        crate::jwt::encode_unsigned(&claims)
     }
 
     #[deprecated(note = "Use generate_jwt")]
@@ -828,7 +941,7 @@ impl Credential {
             audience: Some(OneOrMany::One(StringOrURI::try_from(aud.to_string())?)),
             ..self.to_jwt_claims()?
         };
-        jwt_encode(&claims, &keys)
+        jwt_encode(&claims, keys)
     }
 
     /// Encode the Verifiable Credential as JWT. If JWK is passed, sign it, otherwise it is
@@ -873,9 +986,9 @@ impl Credential {
             Some(_) => return Err(Error::UnencodableOptionClaim("proofPurpose".to_string())),
         }
         let claims = JWTClaims {
-            nonce: challenge.clone(),
+            nonce: challenge,
             audience: match domain {
-                Some(domain) => Some(OneOrMany::One(StringOrURI::try_from(domain.to_string())?)),
+                Some(domain) => Some(OneOrMany::One(StringOrURI::try_from(domain)?)),
                 None => None,
             },
             ..self.to_jwt_claims()?
@@ -886,10 +999,7 @@ impl Credential {
             crate::jwk::Algorithm::None
         };
         // Ensure consistency between key ID and verification method URI.
-        let key_id = match (
-            jwk.and_then(|jwk| jwk.key_id.clone()),
-            verification_method.to_owned(),
-        ) {
+        let key_id = match (jwk.and_then(|jwk| jwk.key_id.clone()), verification_method) {
             (Some(jwk_kid), None) => Some(jwk_kid),
             (None, Some(vm_id)) => Some(vm_id.to_string()),
             (None, None) => None,
@@ -1001,10 +1111,7 @@ impl Credential {
         let verification_method = match header.key_id {
             Some(kid) => kid,
             None => {
-                return (
-                    None,
-                    VerificationResult::error(&format!("JWT header missing key id")),
-                );
+                return (None, VerificationResult::error("JWT header missing key id"));
             }
         };
         let key = match crate::ldp::resolve_key(&verification_method, resolver).await {
@@ -1018,8 +1125,16 @@ impl Credential {
         };
         let mut results = VerificationResult::new();
         if matched_jwt {
-            match crate::jws::verify_bytes(header.algorithm, &signing_input, &key, &signature) {
-                Ok(()) => results.checks.push(Check::JWS),
+            match crate::jws::verify_bytes_warnable(
+                header.algorithm,
+                &signing_input,
+                &key,
+                &signature,
+            ) {
+                Ok(mut warnings) => {
+                    results.checks.push(Check::JWS);
+                    results.warnings.append(&mut warnings);
+                }
                 Err(err) => results
                     .errors
                     .push(format!("Unable to filter proofs: {}", err)),
@@ -1114,7 +1229,7 @@ impl Credential {
                     let proof_purpose = options
                         .proof_purpose
                         .clone()
-                        .unwrap_or_else(|| ProofPurpose::AssertionMethod);
+                        .unwrap_or(ProofPurpose::AssertionMethod);
                     get_verification_methods_for_purpose(&issuer_did, resolver, proof_purpose)
                         .await?
                 } else {
@@ -1130,8 +1245,8 @@ impl Credential {
             .collect();
         let matched_jwt = match jwt_params {
             Some((header, claims)) => jwt_matches(
-                &header,
-                &claims,
+                header,
+                claims,
                 &options,
                 &allowed_vms,
                 &ProofPurpose::AssertionMethod,
@@ -1238,7 +1353,7 @@ impl Credential {
             }
         };
         let mut result = checkable_status.check(self, resolver).await;
-        if result.errors.len() > 0 {
+        if !result.errors.is_empty() {
             return result;
         }
         result.checks.push(Check::CredentialStatus);
@@ -1330,10 +1445,11 @@ impl Presentation {
     }
 
     pub fn to_jwt_claims(&self) -> Result<JWTClaims, Error> {
-        let mut vp = self.clone();
+        let vp = self.clone();
+        let (id, holder) = (vp.id.clone(), vp.holder.clone());
         Ok(JWTClaims {
-            issuer: vp.holder.take().map(|id| id.into()),
-            jwt_id: vp.id.take().map(|id| id.into()),
+            issuer: holder.map(|id| id.into()),
+            jwt_id: id.map(|id| id.into()),
             verifiable_presentation: Some(vp),
             ..Default::default()
         })
@@ -1345,7 +1461,7 @@ impl Presentation {
             audience: Some(OneOrMany::One(StringOrURI::try_from(aud.to_string())?)),
             ..self.to_jwt_claims()?
         };
-        jwt_encode(&claims, &keys)
+        jwt_encode(&claims, keys)
     }
 
     /// Encode the Verifiable Presentation as JWT. If JWK is passed, sign it, otherwise it is
@@ -1390,9 +1506,9 @@ impl Presentation {
             Some(_) => return Err(Error::UnencodableOptionClaim("proofPurpose".to_string())),
         }
         let claims = JWTClaims {
-            nonce: challenge.clone(),
+            nonce: challenge,
             audience: match domain {
-                Some(domain) => Some(OneOrMany::One(StringOrURI::try_from(domain.to_string())?)),
+                Some(domain) => Some(OneOrMany::One(StringOrURI::try_from(domain)?)),
                 None => None,
             },
             ..self.to_jwt_claims()?
@@ -1402,10 +1518,7 @@ impl Presentation {
         } else {
             crate::jwk::Algorithm::None
         };
-        let key_id = match (
-            jwk.and_then(|jwk| jwk.key_id.clone()),
-            verification_method.to_owned(),
-        ) {
+        let key_id = match (jwk.and_then(|jwk| jwk.key_id.clone()), verification_method) {
             (Some(jwk_kid), None) => Some(jwk_kid),
             (None, Some(vm_id)) => Some(vm_id.to_string()),
             (None, None) => None,
@@ -1520,10 +1633,7 @@ impl Presentation {
         let verification_method = match header.key_id {
             Some(kid) => kid,
             None => {
-                return (
-                    None,
-                    VerificationResult::error(&format!("JWT header missing key id")),
-                );
+                return (None, VerificationResult::error("JWT header missing key id"));
             }
         };
         let key = match crate::ldp::resolve_key(&verification_method, resolver).await {
@@ -1537,8 +1647,16 @@ impl Presentation {
         };
         let mut results = VerificationResult::new();
         if matched_jwt {
-            match crate::jws::verify_bytes(header.algorithm, &signing_input, &key, &signature) {
-                Ok(()) => results.checks.push(Check::JWS),
+            match crate::jws::verify_bytes_warnable(
+                header.algorithm,
+                &signing_input,
+                &key,
+                &signature,
+            ) {
+                Ok(mut warnings) => {
+                    results.checks.push(Check::JWS);
+                    results.warnings.append(&mut warnings);
+                }
                 Err(err) => results
                     .errors
                     .push(format!("Unable to filter proofs: {}", err)),
@@ -1585,7 +1703,7 @@ impl Presentation {
                 }
                 CredentialOrJWT::JWT(jwt) => {
                     // https://w3c.github.io/vc-data-model/#example-31-jwt-payload-of-a-jwt-based-verifiable-presentation-non-normative
-                    Credential::from_jwt_unsigned_embedded(&jwt)?;
+                    Credential::from_jwt_unsigned_embedded(jwt)?;
                 }
             };
         }
@@ -1642,8 +1760,8 @@ impl Presentation {
                     let proof_purpose = options
                         .proof_purpose
                         .clone()
-                        .unwrap_or_else(|| ProofPurpose::Authentication);
-                    get_verification_methods_for_purpose(&holder, resolver, proof_purpose).await?
+                        .unwrap_or(ProofPurpose::Authentication);
+                    get_verification_methods_for_purpose(holder, resolver, proof_purpose).await?
                 } else {
                     Vec::new()
                 }
@@ -1657,8 +1775,8 @@ impl Presentation {
             .collect();
         let matched_jwt = match jwt_params {
             Some((header, claims)) => jwt_matches(
-                &header,
-                &claims,
+                header,
+                claims,
                 &options,
                 &allowed_vms,
                 &ProofPurpose::Authentication,
@@ -1844,6 +1962,7 @@ impl Proof {
         }
     }
 
+    #[allow(clippy::ptr_arg)]
     pub fn matches(&self, options: &LinkedDataProofOptions, allowed_vms: &Vec<String>) -> bool {
         if let Some(ref verification_method) = options.verification_method {
             assert_local!(
@@ -1867,6 +1986,9 @@ impl Proof {
         if let Some(ref proof_purpose) = options.proof_purpose {
             assert_local!(self.proof_purpose.as_ref() == Some(proof_purpose));
         }
+        if let Some(ref type_) = options.type_ {
+            assert_local!(&self.type_ == type_);
+        }
         true
     }
 
@@ -1886,7 +2008,7 @@ fn jwt_matches(
     header: &Header,
     claims: &JWTClaims,
     options: &LinkedDataProofOptions,
-    allowed_vms: &Vec<String>,
+    allowed_vms: &[String],
     expected_proof_purpose: &ProofPurpose,
 ) -> bool {
     let LinkedDataProofOptions {
@@ -1904,14 +2026,16 @@ fn jwt_matches(
         assert_local!(allowed_vms.contains(kid));
     }
     if let Some(nbf) = claims.not_before {
-        if let Some(time) = Utc.timestamp_opt(nbf, 0).latest() {
+        let nbf_date_time: LocalResult<DateTime<Utc>> = nbf.into();
+        if let Some(time) = nbf_date_time.latest() {
             assert_local!(created.unwrap_or_else(Utc::now) >= time);
         } else {
             return false;
         }
     }
     if let Some(exp) = claims.expiration_time {
-        if let Some(time) = Utc.timestamp_opt(exp, 0).earliest() {
+        let exp_date_time: LocalResult<DateTime<Utc>> = exp.into();
+        if let Some(time) = exp_date_time.earliest() {
             assert_local!(Utc::now() < time);
         } else {
             return false;
@@ -1930,7 +2054,7 @@ fn jwt_matches(
         //   verify the verifiable presentation).
         if let Some(domain) = domain {
             // Use domain for audience, and require a match.
-            if aud.into_iter().find(|aud| aud.as_str() == domain).is_none() {
+            if !aud.into_iter().any(|aud| aud.as_str() == domain) {
                 return false;
             }
         } else {
@@ -1999,6 +2123,7 @@ fn verify_proof_consistency(proof: &Proof, dataset: &DataSet) -> Result<(), Erro
     match (proof.type_.as_str(), type_iri.as_str()) {
         ("RsaSignature2018", "https://w3id.org/security#RsaSignature2018") => (),
         ("Ed25519Signature2018", "https://w3id.org/security#Ed25519Signature2018") => (),
+        ("Ed25519Signature2020", "https://w3id.org/security#Ed25519Signature2020") => (),
         ("EcdsaSecp256k1Signature2019", "https://w3id.org/security#EcdsaSecp256k1Signature2019") => (),
         ("EcdsaSecp256r1Signature2019", "https://w3id.org/security#EcdsaSecp256r1Signature2019") => (),
         ("EcdsaSecp256k1RecoverySignature2020", "https://identity.foundation/EcdsaSecp256k1RecoverySignature2020#EcdsaSecp256k1RecoverySignature2020") => (),
@@ -2024,17 +2149,17 @@ fn verify_proof_consistency(proof: &Proof, dataset: &DataSet) -> Result<(), Erro
     graph_ref.match_iri_property(
         proof_id,
         "https://w3id.org/security#verificationMethod",
-        proof.verification_method.as_ref().map(|vm| vm.as_str()),
+        proof.verification_method.as_deref(),
     )?;
     graph_ref.match_iri_or_string_property(
         proof_id,
         "https://w3id.org/security#challenge",
-        proof.challenge.as_ref().map(|challenge| challenge.as_str()),
+        proof.challenge.as_deref(),
     )?;
     graph_ref.match_iri_or_string_property(
         proof_id,
         "https://w3id.org/security#domain",
-        proof.domain.as_ref().map(|domain| domain.as_str()),
+        proof.domain.as_deref(),
     )?;
     graph_ref.match_date_property(
         proof_id,
@@ -2076,7 +2201,7 @@ fn verify_proof_consistency(proof: &Proof, dataset: &DataSet) -> Result<(), Erro
     )?;
 
     // Disallow additional unexpected statements
-    for triple in graph_ref.triples.into_iter() {
+    if let Some(triple) = graph_ref.triples.into_iter().next() {
         return Err(Error::UnexpectedTriple(triple.clone()));
     }
 
@@ -2169,6 +2294,76 @@ pub(crate) mod tests {
     use super::*;
     use crate::did::example::DIDExample;
     use crate::urdna2015;
+
+    #[test]
+    fn numeric_date() {
+        assert_eq!(
+            NumericDate::try_from_seconds(NumericDate::MIN.as_seconds()).unwrap(),
+            NumericDate::MIN,
+            "NumericDate::MIN value did not survive round trip"
+        );
+        assert_eq!(
+            NumericDate::try_from_seconds(NumericDate::MAX.as_seconds()).unwrap(),
+            NumericDate::MAX,
+            "NumericDate::MAX value did not survive round trip"
+        );
+
+        assert!(
+            NumericDate::try_from_seconds(NumericDate::MIN.as_seconds() - 1.0e-6).is_err(),
+            "NumericDate::MIN-1.0e-6 value did not hit out-of-range error"
+        );
+        assert!(
+            NumericDate::try_from_seconds(NumericDate::MAX.as_seconds() + 1.0e-6).is_err(),
+            "NumericDate::MAX+1.0e-6 value did not hit out-of-range error"
+        );
+
+        assert!(
+            NumericDate::try_from_seconds(NumericDate::MIN.as_seconds() + 1.0e-6).is_ok(),
+            "NumericDate::MIN-1.0e-6 value did not hit out-of-range error"
+        );
+        assert!(
+            NumericDate::try_from_seconds(NumericDate::MAX.as_seconds() - 1.0e-6).is_ok(),
+            "NumericDate::MAX+1.0e-6 value did not hit out-of-range error"
+        );
+
+        let one_microsecond = Duration::microseconds(1);
+        assert_eq!(
+            (NumericDate::MIN + one_microsecond) - one_microsecond,
+            NumericDate::MIN,
+            "NumericDate::MIN+1.0e-6 wasn't correctly represented"
+        );
+        assert_eq!(
+            (NumericDate::MAX - one_microsecond) + one_microsecond,
+            NumericDate::MAX,
+            "NumericDate::MAX-1.0e-6 wasn't correctly represented"
+        );
+
+        // At the MIN and MAX, increasing by half a microsecond shouldn't alter MIN or MAX.
+        assert_eq!(
+            NumericDate::MIN - Duration::nanoseconds(500),
+            NumericDate::MIN,
+            "NumericDate::MIN isn't the true min"
+        );
+        assert_eq!(
+            NumericDate::MAX + Duration::nanoseconds(500),
+            NumericDate::MAX,
+            "NumericDate::MAX isn't the true max"
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn numeric_date_out_of_range_panic_0() {
+        // At the MIN, subtracting a microsecond should put it just out of range.
+        let _ = NumericDate::MIN - Duration::microseconds(1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn numeric_date_out_of_range_panic_1() {
+        // At the MAX, adding a microsecond should put it just out of range.
+        let _ = NumericDate::MAX + Duration::microseconds(1);
+    }
 
     pub const EXAMPLE_REVOCATION_2020_LIST_URL: &'static str =
         "https://example.test/revocationList.json";
@@ -2273,7 +2468,7 @@ pub(crate) mod tests {
         let (vc_opt, verification_result) =
             Credential::decode_verify_jwt(&signed_jwt, Some(options.clone()), &DIDExample).await;
         println!("{:#?}", verification_result);
-        let vc = vc_opt.unwrap();
+        let _vc = vc_opt.unwrap();
         assert_eq!(verification_result.errors.len(), 0);
     }
 
@@ -2334,6 +2529,48 @@ pub(crate) mod tests {
             Credential::decode_verify_jwt(&signed_jwt, Some(options.clone()), &DIDExample).await;
         println!("{:#?}", verification_result);
         assert!(verification_result.errors.len() > 0);
+    }
+
+    #[async_std::test]
+    async fn decode_verify_jwt_single_array_subject() {
+        let key: JWK = serde_json::from_str(JWK_JSON).unwrap();
+
+        let vc_str = r###"{
+            "@context": [
+                "https://www.w3.org/2018/credentials/v1",
+                "https://www.w3.org/2018/credentials/examples/v1"
+            ],
+            "type": "VerifiableCredential",
+            "issuer": "did:example:foo",
+            "issuanceDate": "2021-09-28T19:58:30Z",
+            "credentialSubject": [{
+                "id": "did:example:a6c78986cc36418b95a22d7f736",
+                "spouse": "Example Person"
+            }]
+        }"###;
+
+        let vc = Credential {
+            expiration_date: Some(VCDateTime::from(Utc::now() + chrono::Duration::weeks(1))),
+            ..serde_json::from_str(vc_str).unwrap()
+        };
+        let aud = "did:example:90336644520443d28ba78beb949".to_string();
+        let options = LinkedDataProofOptions {
+            domain: Some(aud),
+            checks: None,
+            created: None,
+            verification_method: Some(URI::String("did:example:foo#key1".to_string())),
+            ..Default::default()
+        };
+        let signed_jwt = vc
+            .generate_jwt(Some(&key), &options, &DIDExample)
+            .await
+            .unwrap();
+        println!("{:?}", signed_jwt);
+
+        let (vc1_opt, verification_result) =
+            Credential::decode_verify_jwt(&signed_jwt, Some(options.clone()), &DIDExample).await;
+        println!("{:#?}", verification_result);
+        assert!(verification_result.errors.is_empty());
     }
 
     #[async_std::test]

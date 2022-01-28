@@ -31,12 +31,16 @@ use serde_json::Value;
 // @TODO `id` must be URI
 
 pub const DEFAULT_CONTEXT: &str = "https://www.w3.org/ns/did/v1";
+pub const DEFAULT_CONTEXT_NO_WWW: &str = crate::jsonld::DID_V1_CONTEXT_NO_WWW;
 pub const ALT_DEFAULT_CONTEXT: &str = crate::jsonld::W3ID_DID_V1_CONTEXT;
 
 // v0.11 context used by universal resolver
 pub const V0_11_CONTEXT: &str = "https://w3id.org/did/v0.11";
 
+const MULTICODEC_ED25519_PREFIX: [u8; 2] = [0xed, 0x01];
+
 // @TODO parsed data structs for DID and DIDURL
+#[allow(clippy::upper_case_acronyms)]
 type DID = String;
 
 /// [DID URL](https://w3c.github.io/did-core/#did-url-syntax)
@@ -167,6 +171,7 @@ pub struct VerificationMethodMap {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum VerificationMethod {
     DIDURL(DIDURL),
     RelativeDIDURL(RelativeDIDURL),
@@ -397,8 +402,8 @@ impl DIDURL {
                 Ok(path) => path,
                 Err(_) => return None,
             },
-            query: self.query.as_ref().map(|x| x.clone()),
-            fragment: self.fragment.as_ref().map(|x| x.clone()),
+            query: self.query.as_ref().cloned(),
+            fragment: self.fragment.as_ref().cloned(),
         })
     }
 
@@ -407,7 +412,7 @@ impl DIDURL {
         (
             PrimaryDIDURL {
                 did: self.did,
-                path: if self.path_abempty.len() > 0 {
+                path: if !self.path_abempty.is_empty() {
                     Some(self.path_abempty)
                 } else {
                     None
@@ -428,8 +433,8 @@ impl RelativeDIDURL {
         DIDURL {
             did: base_did.to_string(),
             path_abempty: self.path.to_string(),
-            query: self.query.as_ref().map(|x| x.clone()),
-            fragment: self.fragment.as_ref().map(|x| x.clone()),
+            query: self.query.as_ref().cloned(),
+            fragment: self.fragment.as_ref().cloned(),
         }
     }
 }
@@ -471,26 +476,33 @@ impl VerificationMethodMap {
             .property_set
             .as_ref()
             .and_then(|cc| cc.get("publicKeyHex"));
+        let pk_multibase_opt = match self.property_set {
+            Some(ref props) => match props.get("publicKeyMultibase") {
+                Some(Value::String(string)) => Some(string.clone()),
+                Some(Value::Null) => None,
+                Some(_) => return Err(Error::ExpectedStringPublicKeyMultibase),
+                None => None,
+            },
+            None => None,
+        };
         let pk_bytes = match (
             self.public_key_jwk.as_ref(),
             self.public_key_base58.as_ref(),
             pk_hex_value,
+            pk_multibase_opt,
         ) {
-            (Some(pk_jwk), None, None) => return Ok(pk_jwk.clone()),
-            (None, Some(pk_bs58), None) => bs58::decode(&pk_bs58).into_vec()?,
-            (None, None, Some(pk_hex)) => {
+            (Some(pk_jwk), None, None, None) => return Ok(pk_jwk.clone()),
+            (None, Some(pk_bs58), None, None) => bs58::decode(&pk_bs58).into_vec()?,
+            (None, None, Some(pk_hex), None) => {
                 let pk_hex = match pk_hex {
                     Value::String(string) => string,
-                    _ => Err(Error::HexString)?,
+                    _ => return Err(Error::HexString),
                 };
-                let pk_hex = if pk_hex.starts_with("0x") {
-                    &pk_hex[2..]
-                } else {
-                    &pk_hex
-                };
+                let pk_hex = pk_hex.strip_prefix("0x").unwrap_or(pk_hex);
                 hex::decode(pk_hex)?
             }
-            (None, None, None) => Err(Error::MissingKey)?,
+            (None, None, None, Some(pk_mb)) => multibase::decode(pk_mb)?.1,
+            (None, None, None, None) => return Err(Error::MissingKey),
             _ => {
                 // https://w3c.github.io/did-core/#verification-material
                 // "expressing key material in a verification method using both publicKeyJwk and
@@ -505,10 +517,23 @@ impl VerificationMethodMap {
                 public_key: crate::jwk::Base64urlUInt(pk_bytes),
                 private_key: None,
             }),
+            "Ed25519VerificationKey2020" => {
+                if pk_bytes.len() != 34 {
+                    return Err(Error::MultibaseKeyLength(34, pk_bytes.len()));
+                }
+                if &pk_bytes[0..2] != MULTICODEC_ED25519_PREFIX {
+                    return Err(Error::MultibaseKeyPrefix);
+                }
+                crate::jwk::Params::OKP(crate::jwk::OctetParams {
+                    curve: "Ed25519".to_string(),
+                    public_key: crate::jwk::Base64urlUInt(pk_bytes[2..].to_owned()),
+                    private_key: None,
+                })
+            }
             #[cfg(feature = "k256")]
-            "EcdsaSecp256k1VerificationKey2019" => {
+            "EcdsaSecp256k1VerificationKey2019" | "EcdsaSecp256k1RecoveryMethod2020" => {
                 use crate::jwk::secp256k1_parse;
-                return Ok(secp256k1_parse(&pk_bytes).map_err(|e| Error::Secp256k1Parse(e))?);
+                return secp256k1_parse(&pk_bytes).map_err(Error::Secp256k1Parse);
             }
             _ => return Err(Error::UnsupportedKeyType),
         };
@@ -518,12 +543,12 @@ impl VerificationMethodMap {
     /// Verify that a given JWK can be used to satisfy this verification method.
     pub fn match_jwk(&self, jwk: &JWK) -> Result<(), Error> {
         if let Some(ref account_id) = self.blockchain_account_id {
-            let account_id = BlockchainAccountId::from_str(&account_id)?;
-            account_id.verify(&jwk)?;
+            let account_id = BlockchainAccountId::from_str(account_id)?;
+            account_id.verify(jwk)?;
         } else {
             let resolved_jwk = self.get_jwk()?;
-            if !resolved_jwk.equals_public(&jwk) {
-                Err(Error::KeyMismatch)?;
+            if !resolved_jwk.equals_public(jwk) {
+                return Err(Error::KeyMismatch);
             }
         }
         Ok(())
@@ -547,6 +572,8 @@ impl FromStr for DIDURL {
 impl FromStr for PrimaryDIDURL {
     type Err = Error;
     fn from_str(didurl: &str) -> Result<Self, Self::Err> {
+        // Allow non-DID URL for testing lds-ed25519-2020-issuer0
+        #[cfg(not(test))]
         if !didurl.starts_with("did:") {
             return Err(Error::DIDURL);
         }
@@ -557,9 +584,10 @@ impl FromStr for PrimaryDIDURL {
         let before_query = parts.next().unwrap();
         let query = parts.next().map(|x| x.to_owned());
         let (did, path) = match before_query.find('/') {
-            Some(i) => match before_query.split_at(i) {
-                (did, path) => (did.to_string(), Some(path.to_string())),
-            },
+            Some(i) => {
+                let (did, path) = before_query.split_at(i);
+                (did.to_string(), Some(path.to_string()))
+            }
             None => (before_query.to_string(), None),
         };
         Ok(Self { did, path, query })
@@ -589,18 +617,16 @@ impl FromStr for RelativeDIDURLPath {
         if path.is_empty() {
             return Ok(Self::Empty);
         }
-        if path.starts_with("/") {
+        if path.starts_with('/') {
             // path-absolute = "/" [ segment-nz *( "/" segment ) ]
             // segment-nz    = 1*pchar
             // segment       = *pchar
-            if path.len() >= 2 {
-                if path.chars().nth(1) == Some('/') {
-                    // Beginning with "//" would make a scheme-relative URI.
-                    return Err(Error::DIDURL);
-                }
+            if path.len() >= 2 && path.chars().nth(1) == Some('/') {
+                // Beginning with "//" would make a scheme-relative URI.
+                return Err(Error::DIDURL);
             }
             // TODO: validate segment and pchar
-            return Ok(Self::Absolute(path.to_string()));
+            Ok(Self::Absolute(path.to_string()))
         } else {
             // path-noscheme = segment-nz-nc *( "/" segment )
             // segment-nz-nc = 1*( unreserved / pct-encoded / sub-delims / "@" )
@@ -610,7 +636,7 @@ impl FromStr for RelativeDIDURLPath {
                 return Err(Error::DIDURL);
             }
             // TODO: validate segment-nz-nc and pchar more
-            return Ok(Self::NoScheme(path.to_string()));
+            Ok(Self::NoScheme(path.to_string()))
         }
     }
 }
@@ -743,6 +769,7 @@ impl TryFrom<OneOrMany<Context>> for Contexts {
         if first_uri != DEFAULT_CONTEXT
             && first_uri != V0_11_CONTEXT
             && first_uri != ALT_DEFAULT_CONTEXT
+            && first_uri != DEFAULT_CONTEXT_NO_WWW
         {
             return Err(Error::InvalidContext);
         }
@@ -787,6 +814,7 @@ impl DocumentBuilder {
             if first_uri != DEFAULT_CONTEXT
                 && first_uri != V0_11_CONTEXT
                 && first_uri != ALT_DEFAULT_CONTEXT
+                && first_uri != DEFAULT_CONTEXT_NO_WWW
             {
                 return Err(Error::InvalidContext);
             }
@@ -934,14 +962,12 @@ pub mod example {
     };
     use async_trait::async_trait;
 
-    const DOC_JSON_FOO: &'static str = include_str!("../tests/did-example-foo.json");
-    const DOC_JSON_BAR: &'static str = include_str!("../tests/did-example-bar.json");
+    const DOC_JSON_FOO: &str = include_str!("../tests/did-example-foo.json");
+    const DOC_JSON_BAR: &str = include_str!("../tests/did-example-bar.json");
 
     // For vc-test-suite
-    const DOC_JSON_TEST_ISSUER: &'static str =
-        include_str!("../tests/did-example-test-issuer.json");
-    const DOC_JSON_TEST_HOLDER: &'static str =
-        include_str!("../tests/did-example-test-holder.json");
+    const DOC_JSON_TEST_ISSUER: &str = include_str!("../tests/did-example-test-issuer.json");
+    const DOC_JSON_TEST_HOLDER: &str = include_str!("../tests/did-example-test-holder.json");
 
     pub struct DIDExample;
 
@@ -949,7 +975,7 @@ pub mod example {
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl DIDMethod for DIDExample {
         fn name(&self) -> &'static str {
-            return "example";
+            "example"
         }
 
         fn to_resolver(&self) -> &dyn DIDResolver {
@@ -1131,6 +1157,7 @@ mod tests {
         assert_eq!(jwk, pk_jwk);
     }
 
+    #[test]
     #[cfg(feature = "k256")]
     fn vmm_hex_to_jwk() {
         // publicKeyHex (deprecated) -> JWK

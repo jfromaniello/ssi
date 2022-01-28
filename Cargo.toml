@@ -23,11 +23,14 @@ ripemd-160 = ["ripemd160", "secp256k1"]
 # TODO handle better keccak and sha
 keccak = ["keccak-hash", "secp256k1", "k256/keccak256"]
 sha = ["sha2", "k256/sha256"]
+example-http-issuer = []
 
 [dependencies]
 json-ld = "0.4"
-bbs = "0.4.1"
-pairing-plus = "0.19"
+# SAFETY: bbs and pairing-plus are set to specific versions due to a
+# dependency on internal struct representations using transmute in src/bbs.rs.
+bbs = "=0.4.1"
+pairing-plus = "=0.19.0"
 ff = { version = "0.6", package = "ff-zeroize" }
 hkdf = "0.8"
 zeroize = { version = "1.4", features = ["zeroize_derive"] }
@@ -71,12 +74,14 @@ ecdsa = "0.11.1"
 digest = "0.9"
 k256 = { version = "0.8", optional = true, features = ["zeroize", "ecdsa"] }
 p256 = { version = "0.8", optional = true, features = ["zeroize", "ecdsa"] }
-ssi-contexts = { version = "0.1.0", path = "contexts/" }
+ssi-contexts = { version = "0.1.2", path = "contexts/" }
 ripemd160 = { version = "0.9", optional = true }
 sshkeys = "0.3"
 reqwest = { version = "0.11", features = ["json"] }
 flate2 = "1.0"
 bitvec = "0.20"
+clear_on_drop = "0.2.4"
+url = { version = "2.2", features = ["serde"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 chrono = { version = "0.4", features = ["serde"] }
@@ -101,7 +106,12 @@ members = [
 ]
 
 [dev-dependencies]
+blake2 = "0.8" # for bbs doctest
 uuid = { version = "0.8", features = ["v4", "serde"] }
 difference = "2.0"
 did-method-key = { path = "./did-key" }
 tokio = { version = "1.0", features = ["macros"] }
+
+[package.metadata.docs.rs]
+features = ["secp256r1", "secp256k1", "ripemd-160", "http-did"]
+rustdoc-args = ["--cfg", "docsrs"]
